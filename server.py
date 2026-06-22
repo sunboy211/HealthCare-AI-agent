@@ -1,61 +1,97 @@
 import os
-from fastapi import FastAPI, HTTPException
+import logging
+from typing import List
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from openai import OpenAI
+from openai import AsyncOpenAI, OpenAIError
 from dotenv import load_dotenv
 
-# 1. 自动加载本地环境变量（读取 .env 文件）
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("WearCareAPI")
+# 1. load env
 load_dotenv()
 
-# 2. 初始化 FastAPI 应用实例
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+        logger.info(f"Nurse online. Online device number: {len(self.active_connections)}")
+
+    def disconnect(self, websocket: WebSocket):
+        self.active_connections.remove(websocket)
+        logger.info(f"Nurse offline. Online device number: {len(self.active_connections)}")
+
+    async def broadcast_alert(self, message: dict):
+        for connection in self.active_connections:
+            try:
+                await connection.send_json(message)
+            except Exception as e:
+                logger.error(f"Failed to push data to a frontend: {str(e)}")
+
+manager = ConnectionManager()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    if not os.getenv("OPENAI_API_KEY"):
+        logger.error("Critical: OPENAI_API_KEY is missing!")
+        raise RuntimeWarning("Missing OPENAI_API_KEY")
+
+    app.state.openai_client = AsyncOpenAI()
+    logger.info("OpenAI Asynchronous client initialization successful.")
+    yield
+    await app.state.openai_client.close()
+
+# 2. initialize FastAPI
 app = FastAPI(
-    title="Wear&Care AI Insights API",
-    description="微服务接口：将物联网（IoT）传感器的原始数据流转化为管理仪表盘所需的结构化 JSON 指标。",
+    title="Wear&Care AI Insights API with Real-time Alerts",
+    description="Microservice Interface: Transforms raw data streams from Internet of Things (IOT) sensors into structured JSON metrics required for management dashboards.",
     version="1.0.0"
 )
 
-# 3. 配置跨域资源共享（CORS），让你的前端 Dashboard 网页可以安全地跨域访问此接口
+# 3. Cross-Origin Resource Sharing
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 在真实生产环境中，Wear&Care 会将其严格限制为自己的官网域名
+    allow_origins=["https://wearcare.com"],  # Wear&Care url
     allow_credentials=True,
     allow_headers=["*"],
-    allow_methods=["*"],
+    allow_methods=["POST", "GET"],
 )
 
 
-# 4. 定义前端发来的请求体（Request Payload）应该长什么样
+# 4. Define what the request payload sent from the frontend
 class SensorDataPayload(BaseModel):
-    raw_logs: str = Field(..., description="来自养老院的物联网传感器原始文本日志。")
+    raw_logs: str = Field(..., description="Raw text logs from IOT sensors in nursing homes.")
 
 
-# 5. 定义大模型在返回时必须严格遵守的 JSON 结构模型
+# 5. Define the JSON structure model that the large model must strictly adhere to when returning it.
 class CareReport(BaseModel):
-    room_number: str = Field(description="养老院的房间号，例如 'Room 302'")
-    patient_name: str = Field(description="老人的姓名")
-    summary: str = Field(description="给部门经理看的一句话自然语言总结。字数控制在100字以内。")
+    room_number: str = Field(description="The room number of the nursing home, for example, 'Room 302' ")
+    patient_name: str = Field(description="The name")
+    summary: str = Field(description="A one-sentence summary in natural language for the department manager. Keep it under 100 words.")
     anomaly_detected: bool = Field(
-        description="如果日志中包含异常行为、异常模式或需要紧急升级的情况，则设为 True；否则为 False。")
-    care_suggestion: str = Field(description="给当班护工的下一步具体行动建议或护理指南。")
+        description="Set to True if the logs contain abnormal behavior, abnormal patterns, or situations requiring urgent escalation; otherwise, set to False.")
+    care_suggestion: str = Field(description="Specific next steps or nursing guidelines for the on-duty caregiver.")
 
 
-# 6. 创建让前端 Dashboard 调用的真实 API 路由路径（Endpoint）
+# 6. Create the actual API route path (Endpoint) that the front-end Dashboard calls.
 @app.post("/api/v1/insights/generate", response_model=CareReport)
 async def generate_dashboard_insights(payload: SensorDataPayload):
     """
-    接收原始传感器文本数据，通过 OpenAI 的结构化输出机制进行分析，
-    并返回一个为管理仪表盘完美优化的干净 JSON 对象。
+    Receive raw IoT logs for large-scale model analysis.
+    If an anomaly is detected (anomaly_detected == True), immediately bombard all front-end dashboards via WebSocket.
     """
-    # 初始化客户端，OpenAI 的 SDK 会自动寻找并读取环境变量
-    client = OpenAI()
+    client: AsyncOpenAI = app.state.openai_client
 
     if not os.getenv("OPENAI_API_KEY"):
-        raise HTTPException(status_code=500, detail="服务器环境中缺失 OpenAI API Key，请检查 .env 文件。")
+        raise HTTPException(status_code=500, detail="The OpenAI API Key is missing from your server environment. Please check your .env file.")
 
     try:
-        # 触发大模型的结构化解析功能
-        response = client.beta.chat.completions.parse(
+        response = await client.beta.chat.completions.parse(
             model="gpt-4o-mini",
             messages=[
                 {
@@ -67,18 +103,49 @@ async def generate_dashboard_insights(payload: SensorDataPayload):
                     "content": payload.raw_logs
                 }
             ],
-            response_format=CareReport,  # 【核心】逼迫大模型强制对齐上方定义好的 Pydantic 结构
-            temperature=0.0  # 设为 0.0 让结果绝对严谨，防止医疗护理数据出现 AI 幻觉
+            response_format=CareReport,  # Predefined Pydantic structure
+            temperature=0.0,
+            timeout = 30.0
         )
 
-        # FastAPI 会极其聪明地将解析好的 Pydantic 对象自动序列化为标准的 JSON 字符串返回给客户端！
-        return response.choices[0].message.parsed
+        # FastAPI intelligent in serializing the parsed Pydantic object into a standard JSON string and returning it to the client
+        report: CareReport = response.choices[0].message.parsed
+        if report.anomaly_detected:
+            logger.warning(f"abnormal detected！Room: {report.room_number}, Elderly: {report.patient_name}")
+            alert_payload = {
+                "event": "EMERGENCY_ALERT",
+                "room_number": report.room_number,
+                "patient_name": report.patient_name,
+                "summary": report.summary,
+                "care_suggestion": report.care_suggestion
+            }
+            await manager.broadcast_alert(alert_payload)
 
+        return report
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"LLM 解析时发生内部错误: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"An internal error occurred during LLM parsing: {str(e)}")
+    except Exception as e:
+        logger.error(f"Internal unknown error: {str(e)}")
+        raise HTTPException(status_code=502, detail="Internal server error")
 
 
-# 7. 基础的服务器健康检查路由
+# 5. WebSocket real-time alert
+@app.websocket("/ws/alerts")
+async def websocket_alerts_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+    try:
+        # wait to receive data
+        while True:
+            data = await websocket.receive_text()
+            if data == "ping":
+                await websocket.send_text("pong") # an example
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+    except Exception as e:
+        logger.error(f"WebSocket Abnormal disconnection: {str(e)}")
+        manager.disconnect(websocket)
+
+
 @app.get("/health")
 async def health_check():
     return {"status": "healthy", "service": "WearCare-AI-Layer"}
