@@ -10,7 +10,6 @@ from dotenv import load_dotenv
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("WearCareAPI")
-# 1. load env
 load_dotenv()
 
 class ConnectionManager:
@@ -46,14 +45,13 @@ async def lifespan(app: FastAPI):
     yield
     await app.state.openai_client.close()
 
-# 2. initialize FastAPI
 app = FastAPI(
     title="Wear&Care AI Insights API with Real-time Alerts",
     description="Microservice Interface: Transforms raw data streams from Internet of Things (IOT) sensors into structured JSON metrics required for management dashboards.",
     version="1.0.0"
 )
 
-# 3. Cross-Origin Resource Sharing
+# Cross-Origin Resource Sharing
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://wearcare.com"],  # Wear&Care url
@@ -63,12 +61,12 @@ app.add_middleware(
 )
 
 
-# 4. Define what the request payload sent from the frontend
+# Define what the request payload sent from the frontend
 class SensorDataPayload(BaseModel):
     raw_logs: str = Field(..., description="Raw text logs from IOT sensors in nursing homes.")
 
 
-# 5. Define the JSON structure model that the large model must strictly adhere to when returning it.
+# Define the JSON structure model that the large model must strictly adhere to when returning it.
 class CareReport(BaseModel):
     room_number: str = Field(description="The room number of the nursing home, for example, 'Room 302' ")
     patient_name: str = Field(description="The name")
@@ -78,7 +76,7 @@ class CareReport(BaseModel):
     care_suggestion: str = Field(description="Specific next steps or nursing guidelines for the on-duty caregiver.")
 
 
-# 6. Create the actual API route path (Endpoint) that the front-end Dashboard calls.
+# Create the actual API route path (Endpoint) that the front-end Dashboard calls.
 @app.post("/api/v1/insights/generate", response_model=CareReport)
 async def generate_dashboard_insights(payload: SensorDataPayload):
     """
@@ -129,7 +127,7 @@ async def generate_dashboard_insights(payload: SensorDataPayload):
         raise HTTPException(status_code=502, detail="Internal server error")
 
 
-# 5. WebSocket real-time alert
+# WebSocket real-time alert
 @app.websocket("/ws/alerts")
 async def websocket_alerts_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
