@@ -4,7 +4,6 @@ from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
 load_dotenv()
-# 1. Define the structured JSON response layout that the management dashboard expects
 class CareReport(BaseModel):
     room_number: str = Field(description="The care home room number, e.g., 'Room 302'")
     patient_name: str = Field(description="The name of the resident/patient")
@@ -17,11 +16,10 @@ class CareReport(BaseModel):
 
 
 def generate_json_report(sensor_data: str):
-    # Ensure you replace this with your actual API key
+    # the API key
     client = OpenAI()
 
     try:
-        # 2. Utilize OpenAI's Structured Outputs via the Beta parse API
         response = client.beta.chat.completions.parse(
             model="gpt-4o-mini",
             messages=[
@@ -38,7 +36,6 @@ def generate_json_report(sensor_data: str):
             temperature=0.0  # Deterministic output to prevent hallucination in care data
         )
 
-        # 3. Extract and return the parsed Python object directly
         return response.choices[0].message.parsed
 
     except Exception as e:
